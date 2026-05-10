@@ -2,8 +2,10 @@ package opencode
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -419,6 +421,92 @@ func TestLoadConfigProvidersInvalidJSON(t *testing.T) {
 	}
 	if len(config) != 0 {
 		t.Fatalf("expected empty map on parse error, got %v", config)
+	}
+}
+
+// TestLoadConfigProvidersEmptyPath guards against callers passing an empty
+// string. DefaultSettingsPath returns "" when os.UserHomeDir fails, so this
+// path can reach LoadConfigProviders in the wild without any user error.
+// An empty path is treated as a missing file (read fails with ErrNotExist),
+// so we must return (empty, nil) — never a non-nil error or a panic.
+func TestLoadConfigProvidersEmptyPath(t *testing.T) {
+	config, err := LoadConfigProviders("")
+	if err != nil {
+		t.Fatalf("empty path should not produce an error, got %v", err)
+	}
+	if len(config) != 0 {
+		t.Fatalf("expected empty map for empty path, got %v", config)
+	}
+}
+
+// TestLoadConfigProvidersPermissionDenied verifies that a real OS error other
+// than ErrNotExist is surfaced to the caller (instead of being silently
+// swallowed). The picker's ConfigWarning relies on this so the user can see
+// in the TUI when their opencode.json is unreadable for a reason other than
+// "file does not exist".
+func TestLoadConfigProvidersPermissionDenied(t *testing.T) {
+	// Skip on Windows where chmod 0o000 does not enforce read-deny the same way.
+	if runtime.GOOS == "windows" {
+		t.Skip("permission semantics differ on Windows")
+	}
+	// Skip when running as root — root bypasses 0o000.
+	if os.Geteuid() == 0 {
+		t.Skip("running as root bypasses file permissions")
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "opencode.json")
+	if err := os.WriteFile(path, []byte(`{"provider":{}}`), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	if err := os.Chmod(path, 0o000); err != nil {
+		t.Fatalf("chmod 0o000: %v", err)
+	}
+	t.Cleanup(func() {
+		// Restore writable mode so t.TempDir cleanup can remove the file.
+		_ = os.Chmod(path, 0o644)
+	})
+
+	config, err := LoadConfigProviders(path)
+	if err == nil {
+		t.Fatal("expected error for unreadable file, got nil")
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("permission-denied error should not be classified as not-exist, got %v", err)
+	}
+	if len(config) != 0 {
+		t.Fatalf("expected empty map alongside error, got %v", config)
+	}
+}
+
+// TestLoadConfigProvidersEmptyModelsMap covers the common in-progress
+// configuration where the user has declared the provider block but has not
+// added any models yet. Loading must succeed and return the provider with
+// an empty (or nil) Models map, NOT skip the provider entirely.
+func TestLoadConfigProvidersEmptyModelsMap(t *testing.T) {
+	path := writeConfigFixture(t, `{
+		"provider": {
+			"lmstudio": {
+				"name": "LM Studio (local)",
+				"options": {"baseURL": "http://localhost:1234/v1"},
+				"models": {}
+			}
+		}
+	}`)
+
+	config, err := LoadConfigProviders(path)
+	if err != nil {
+		t.Fatalf("LoadConfigProviders() error = %v", err)
+	}
+	lm, ok := config["lmstudio"]
+	if !ok {
+		t.Fatal("provider with empty models map must still be loaded")
+	}
+	if lm.Name != "LM Studio (local)" {
+		t.Fatalf("provider name = %q, want %q", lm.Name, "LM Studio (local)")
+	}
+	if len(lm.Models) != 0 {
+		t.Fatalf("models count = %d, want 0", len(lm.Models))
 	}
 }
 
